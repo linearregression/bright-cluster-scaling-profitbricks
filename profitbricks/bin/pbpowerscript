@@ -1,0 +1,277 @@
+#!/bin/bash
+
+#
+# custom power script for ProfitBricks cloud
+# V0.3, 2016-05-04, J.Buchhammer (JBU), ProfitBricks GmbH
+# - improve error handling, logging
+# V0.4, 2016-05-06, JBU
+# - add reset, status handling
+# V0.5, 2016-05-09, JBU
+# - chg paths w/ base /cm/local/profitbricks
+# - rename pb-config.txt to pb-powerscript.conf
+# V0.7, 2016-05-10 11:30
+# - fix missing space in test expression
+# - disable 2 ssl warnings caused by old python version 2.7.5
+#
+
+# Copyright (c) ProfitBricks GmbH / Bright Computing Holding BV. All Rights Reserved.
+#
+
+#
+# Custom cmdaemon power managment should adhere to the following rules
+#
+# Command line passed by cmdaemon: <action> <hostname>
+# JBU: optional 3rd param: 'volatile' if nodes are created/destroyed on demand
+#
+# Script should exit with code when successful and contain
+# the result in the first line of the output
+#
+# Action:  ON
+#  result: ON / FAILED
+#
+# Action:  OFF
+#  result: OFF / FAILED
+#
+# Action:  RESET
+#  result: RESET* / OFF / FAILED
+#
+# Action:  STATUS
+#  result: ON / OFF / RESET / FAILED
+#
+# * power is in twilight state between on and off, used in ipmi
+#
+# UNKNOWN should be returned for unknown devices or actions
+#
+# =======================================================================
+# log file
+POWERLOG=/var/log/profitbricks_powerscript.log
+# profitbricks base dir
+PB_BASEDIR=/cm/local/profitbricks
+# profitbricks bin dir
+PB_BINDIR=${PB_BASEDIR}/bin
+# configuration for VDC's nodes (ID, RAM,..)
+POWERCONF=${PB_BASEDIR}/etc/pb-powerscript.conf
+# cmsh executable
+CMSH_CMD=/cm/local/apps/cmd/bin/cmsh
+# disable python 2.7.5 warnings
+PYTHONWARNINGS="ignore:An HTTPS request has been made:Warning,ignore:A true SSLContext object is not available:Warning"
+export PYTHONWARNINGS
+
+
+### subs ###
+
+LogMsg() {
+  # write message to log file as "<timestamp> <node> <message>"
+  # timestamp is like ISO-8601 format w/o TZ
+  tstamp=`date +"%FT%T"`
+  echo $tstamp "[$NODE]" "$@" >> ${POWERLOG}
+ }   # end LogMsg()
+
+EndScript() {
+  # print action result and end script w/ return code
+  # params: rc, action result, log message
+  rc=$1
+  result=$2
+  msg=$3
+  LogMsg $msg
+  echo $result
+  LogMsg "$0 finished at "`date`" with rc=$rc ($result)"
+  exit $rc
+}   # end EndScript()
+
+#------------
+
+### main ###
+
+# default state 
+NODESTATE="FAILED"
+# temp name until params are verified
+NODE=INIT
+
+LogMsg "call of $0 at "`date`" with args $@"
+
+if [ -z "$1" -o -z "$2" ]; then
+	EndScript 1 ${NODESTATE} "invalid call: arguments missing"
+fi
+# now we should have a real node name
+NODE=$2
+
+LogMsg "read configuration"
+if [ ! -e $POWERCONF ]; then
+	EndScript 1 ${NODESTATE} "missing configuration file '$POWERCONF'"
+fi
+. ${POWERCONF}
+
+if [ "$1" == "STATUS" ]; then
+  LogMsg "getting status for node $NODE"
+  nodeinfo="/var/spool/cmd/${NODE}_info.txt"
+  python -u $PB_BINDIR/pb_getServerInfo.py -L $PB_LOGIN_CONF -d $PB_DCID -n $NODE  > $nodeinfo 2>&1
+  cmdrc=$?
+  if [ $cmdrc -ne 0 ]; then
+    EndScript 2 ${NODESTATE} "getting node data failed w/rc=$cmdrc"
+  fi
+  grep -q "state" $nodeinfo > /dev/null
+  if [ $? -ne 0 ]; then
+    # assume that the node doesn't exist if there's no state in the output
+    EndScript 0 "OFF" "No state for node $NODE available, assume it's removed"
+  fi
+  # we only test 'state'
+  # to be more precise, 'vmstate'=='RUNNING' is the only exact state for 'ON'
+  # having 'state'=='AVAILABLE', but 'vmstate'=='SHUTOFF' would be something between 'ON' and 'OFF'
+  serverstate=`sed -n "s/.*'state': u'\([a-zA-Z]\{1,\}\)'.*/\1/p" $nodeinfo`
+  if [ "$serverstate" == "AVAILABLE" ]; then
+    EndScript 0 "ON" "Node $NODE is in state 'available'"
+  else
+    EndScript 0 "OFF" "Node $NODE is not in state 'available'"
+  fi
+elif [ "$1" == "ON" ]; then
+  LogMsg "turn on node $NODE"
+  if [ "volatile" == "$3" ]; then
+    LogMsg "creating volatile node $NODE"
+    nodeinfo="/var/spool/cmd/${NODE}_info.txt"
+    LogMsg "testing MAC of new $NODE"
+    python -u $PB_BINDIR/pb_getServerInfo.py -L $PB_LOGIN_CONF -d $PB_DCID -n $NODE  > $nodeinfo 2>&1
+    cmdrc=$?
+    if [ $cmdrc -ne 0 ]; then
+      EndScript 2 ${NODESTATE} "getting node data failed w/rc=$cmdrc"
+    fi
+    grep -q "macs" $nodeinfo > /dev/null
+    if [ $? -ne 0 ]; then
+      LogMsg "node not ready, creating"
+      python -u $PB_BINDIR/pb_addNewServer.py -L $PB_LOGIN_CONF -d $PB_DCID -l $PB_LANID -c $PB_CREATE_CPU -r $PB_CREATE_RAM -s $PB_CREATE_STORAGE -n $NODE -v >> ${POWERLOG} 2>&1
+      cmdrc=$?
+      if [ $cmdrc -ne 0 ]; then
+        EndScript 2 ${NODESTATE} "creating node $NODE failed w/rc=$cmdrc"
+      fi
+      LogMsg "creating node $NODE ended"
+      LogMsg "getting MAC of new $NODE"
+      python -u $PB_BINDIR/pb_getServerInfo.py -L $PB_LOGIN_CONF -d $PB_DCID -n $NODE  > $nodeinfo 2>&1
+      cmdrc=$?
+      if [ $cmdrc -ne 0 ]; then
+        EndScript 2 ${NODESTATE} "getting node data failed w/rc=$cmdrc"
+      fi
+    fi 
+    cat $nodeinfo >> ${POWERLOG}
+    # NOTE: this is very dirty by now!
+    macs=`sed -ne 's/^INFO.*\([0-9a-f:]\{17\}\).*/\1/p' $nodeinfo`
+    cmdrc=$?
+    if [ $cmdrc -ne 0 ]; then
+      EndScript 2 ${NODESTATE} "getting MAC failed w/rc=$cmdrc"
+    fi
+    LogMsg "MAC is $macs"
+    LogMsg "initialising MAC for node $NODE.."
+    ${CMSH_CMD} -c "device;set $NODE mac $macs;commit;quit" >> ${POWERLOG} 2>&1
+    cmdrc=$?
+    if [ $cmdrc -ne 0 ]; then
+      EndScript 2 ${NODESTATE} "initialising MAC for node $NODE failed w/rc=$cmdrc"
+    fi
+    LogMsg "initialising mac ended successful"
+  else
+    python -u $PB_BINDIR/pb_controlServerState.py -L $PB_LOGIN_CONF -d $PB_DCID -n $NODE -a POWERON >> ${POWERLOG} 2>&1
+    cmdrc=$?
+    if [ $cmdrc -ne 0 ]; then
+      EndScript 2 ${NODESTATE} "power on node $NODE failed w/rc=$cmdrc"
+    fi
+    LogMsg "node $NODE powered on"
+  fi   # end if/else(volatile)
+  EndScript 0 "$1" "node $NODE turned $1"
+elif [ "$1" == "OFF" ]; then
+  LogMsg "reset node $NODE"
+  if [ "volatile" == "$3" ]; then
+    LogMsg "deleting volatile node $NODE"
+    python -u $PB_BINDIR/pb_deleteServer.py -L $PB_LOGIN_CONF -d $PB_DCID -n $NODE >> ${POWERLOG} 2>&1
+    cmdrc=$?
+    if [ $cmdrc -ne 0 ]; then
+      EndScript 2 ${NODESTATE} "deleting node $NODE failed w/rc=$cmdrc"
+    fi
+    LogMsg "deleting node $NODE was successful"
+    LogMsg "resetting mac.."
+    ${CMSH_CMD} -c "device;set $NODE mac 00:00:00:00:00:00;commit;quit" >> ${POWERLOG} 2>&1
+    cmdrc=$?
+    if [ $cmdrc -ne 0 ]; then
+      EndScript 2 ${NODESTATE} "resetting MAC for node $NODE failed w/rc=$cmdrc"
+    fi
+    LogMsg "resetting mac was successful"
+  else
+    LogMsg "shut down OS - Errors are ignored!"
+    ${CMSH_CMD} -c "device;shutdown $NODE" >> ${POWERLOG} 2>&1
+    cmdrc=$?
+    if [ $cmdrc -ne 0 ]; then
+      LogMsg "shut down node $NODE failed w/rc=$cmdrc"
+    else
+      LogMsg "shut down node $NODE initiated"
+    fi
+    LogMsg "power off node $NODE"
+    python -u $PB_BINDIR/pb_controlServerState.py -L $PB_LOGIN_CONF -d $PB_DCID -n $NODE -a POWEROFF  >> ${POWERLOG} 2>&1
+    cmdrc=$?
+    if [ $cmdrc -ne 0 ]; then
+      EndScript 2 ${NODESTATE} "power off node $NODE failed w/rc=$cmdrc"
+    fi
+  fi   # end if/else(volatile)
+  EndScript 0 "$1" "node $NODE turned $1"
+elif [ "$1" == "RESET" ]; then
+  LogMsg "turn off node $NODE"
+  if [ "volatile" == "$3" ]; then
+    LogMsg "deleting volatile node $NODE"
+    python -u $PB_BINDIR/pb_deleteServer.py -L $PB_LOGIN_CONF -d $PB_DCID -n $NODE >> ${POWERLOG} 2>&1
+    cmdrc=$?
+    if [ $cmdrc -ne 0 ]; then
+      EndScript 2 ${NODESTATE} "deleting node $NODE failed w/rc=$cmdrc"
+    fi
+    LogMsg "deleting node $NODE was successful"
+    LogMsg "creating volatile node $NODE"
+    python -u $PB_BINDIR/pb_addNewServer.py -L $PB_LOGIN_CONF -d $PB_DCID -l $PB_LANID -c $PB_CREATE_CPU -r $PB_CREATE_RAM -s $PB_CREATE_STORAGE -n $NODE -v >> ${POWERLOG} 2>&1
+    cmdrc=$?
+    if [ $cmdrc -ne 0 ]; then
+      EndScript 2 ${NODESTATE} "creating node $NODE failed w/rc=$cmdrc"
+    fi
+    LogMsg "creating node $NODE ended"
+    LogMsg "getting MAC of new $NODE"
+    nodeinfo="/var/spool/cmd/${NODE}_info.txt"
+    python -u $PB_BINDIR/pb_getServerInfo.py -L $PB_LOGIN_CONF -d $PB_DCID -n $NODE  > $nodeinfo 2>&1
+    cmdrc=$?
+    if [ $cmdrc -ne 0 ]; then
+      EndScript 2 ${NODESTATE} "getting node data failed w/rc=$cmdrc"
+    fi
+    cat $nodeinfo >> ${POWERLOG}
+    # NOTE: this is very dirty by now!
+    macs=`sed -ne 's/^INFO.*\([0-9a-f:]\{17\}\).*/\1/p' $nodeinfo`
+    cmdrc=$?
+    if [ $cmdrc -ne 0 ]; then
+      EndScript 2 ${NODESTATE} "getting MAC failed w/rc=$cmdrc"
+    fi
+    LogMsg "MAC is $macs"
+    LogMsg "initialising MAC for node $NODE.."
+    ${CMSH_CMD} -c "device;set $NODE mac $macs;commit;quit" >> ${POWERLOG} 2>&1
+    cmdrc=$?
+    if [ $cmdrc -ne 0 ]; then
+      EndScript 2 ${NODESTATE} "initialising MAC for node $NODE failed w/rc=$cmdrc"
+    fi
+    LogMsg "initialising mac ended successful"
+  else
+    # reboot_server currently not implemented in pb_controlServerState.py
+    # so we need to power off/power on instead
+    LogMsh "shut down OS - Errors are ignored!"
+    ${CMSH_CMD} -c "device;shutdown $NODE" >> ${POWERLOG} 2>&1
+    cmdrc=$?
+    if [ $cmdrc -ne 0 ]; then
+      LogMsg "shut down node $NODE failed w/rc=$cmdrc"
+    else
+      LogMsg "shut down node $NODE initiated"
+    fi
+    LogMsg "power off node $NODE"
+    python -u $PB_BINDIR/pb_controlServerState.py -L $PB_LOGIN_CONF -d $PB_DCID -n $NODE -a POWEROFF  >> ${POWERLOG} 2>&1
+    cmdrc=$?
+    if [ $cmdrc -ne 0 ]; then
+      EndScript 2 ${NODESTATE} "power off node $NODE failed w/rc=$cmdrc"
+    fi
+    python -u $PB_BINDIR/pb_controlServerState.py -L $PB_LOGIN_CONF -d $PB_DCID -n $NODE -a POWERON >> ${POWERLOG} 2>&1
+    cmdrc=$?
+    if [ $cmdrc -ne 0 ]; then
+      EndScript 2 ${NODESTATE} "power on node $NODE failed w/rc=$cmdrc"
+    fi
+    LogMsg "node $NODE powered on"
+  fi   # end if/else(volatile)
+else
+  EndScript 1 "UNKNOWN" "invalid action"
+fi
