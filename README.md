@@ -7,8 +7,10 @@ Bright Computing Cluster Manager's (BCM) included cluster scaling provides a mec
 In a ProfitBricks cloud this mechanism can be extended in a way that virtual nodes may even be created or destroyed. This dynamic scaling thus helps to reduce costs for High Performance Computing and BigData Clusters.
 
 The solution in this repository can easily be installed on a Bright cluster head node and contains the configuration files and scripts to
+
 - dynamically create and remove nodes,
 - dynamically power on and power off nodes.
+
 You may as well have some nodes which are always up and running.
 
 
@@ -67,13 +69,13 @@ Thus, the timeout must be increased to the maximum value of 120 seconds:
 
 1. Add
 
-`AdvancedConfig = { "CustomPowerTimeout=120" }`
+		AdvancedConfig = { "CustomPowerTimeout=120" }
 
-to file `/cm/local/apps/cmd/etc/cmd.conf`.
+	to file `/cm/local/apps/cmd/etc/cmd.conf`.
 
 2. Restart CMDaemon by
 
-`systemctl restart cmd.service`
+		systemctl restart cmd.service
 
 ## Configuration of cluster scaling
 This solution uses ProfitBricks' Cloud API. To avoid providing your ProfitBricks account data on the command line, you can use a login configuration file.
